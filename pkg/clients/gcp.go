@@ -18,12 +18,14 @@ package gcp
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"path"
 	"strings"
 
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/api/googleapi"
+	"google.golang.org/api/impersonate"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -31,12 +33,18 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/pkg/errors"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
 
 	cmpv1beta1 "github.com/crossplane/provider-gcp/apis/compute/v1beta1"
 	"github.com/crossplane/provider-gcp/apis/v1alpha3"
 	"github.com/crossplane/provider-gcp/apis/v1beta1"
+)
+
+const (
+	keyServiceAccount  = "iam.gke.io/gcp-service-account"
+	scopeCloudPlatform = "https://www.googleapis.com/auth/cloud-platform"
 )
 
 // GetAuthInfo returns the necessary authentication information that is necessary
@@ -79,11 +87,27 @@ func UseProviderConfig(ctx context.Context, c client.Client, mg resource.Managed
 	if err := c.Get(ctx, types.NamespacedName{Name: mg.GetProviderConfigReference().Name}, pc); err != nil {
 		return "", nil, err
 	}
-	data, err := resource.CommonCredentialExtractor(ctx, pc.Spec.Credentials.Source, c, pc.Spec.Credentials.CommonCredentialSelectors)
-	if err != nil {
-		return "", nil, errors.Wrap(err, "cannot get credentials")
+	switch s := pc.Spec.Credentials.Source; s { //nolint:exhaustive
+	case xpv1.CredentialsSourceInjectedIdentity:
+		sa, ok := pc.ObjectMeta.Annotations[keyServiceAccount]
+		if !ok {
+			return "", nil, fmt.Errorf("service account not found in %q", keyServiceAccount)
+		}
+		ts, err := impersonate.CredentialsTokenSource(ctx, impersonate.CredentialsConfig{
+			TargetPrincipal: sa,
+			Scopes:          []string{scopeCloudPlatform},
+		})
+		if err != nil {
+			return "", nil, err
+		}
+		return pc.Spec.ProjectID, option.WithTokenSource(ts), nil
+	default:
+		data, err := resource.CommonCredentialExtractor(ctx, pc.Spec.Credentials.Source, c, pc.Spec.Credentials.CommonCredentialSelectors)
+		if err != nil {
+			return "", nil, errors.Wrap(err, "cannot get credentials")
+		}
+		return pc.Spec.ProjectID, option.WithCredentialsJSON(data), nil
 	}
-	return pc.Spec.ProjectID, option.WithCredentialsJSON(data), nil
 }
 
 // IsErrorNotFoundGRPC gets a value indicating whether the given error represents
